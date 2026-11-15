@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 DEFAULT_VOICE = os.environ.get("TTS_VOICE", "en-US-GuyNeural")
+# Slightly faster than default reads as more energetic on Shorts.
+DEFAULT_RATE = os.environ.get("TTS_RATE", "+8%")
 
 
 @dataclass
@@ -17,13 +19,20 @@ class TTSResult:
     duration_seconds: float
     # (text_chunk, start_seconds, end_seconds) per input line
     line_timings: List[Tuple[str, float, float]]
+    # (word, start_seconds, end_seconds) for every spoken word, in order.
+    # Empty if the TTS service didn't return word timings.
+    word_timings: List[Tuple[str, float, float]] = None
 
 
 async def _synthesize(text_lines: List[str], out_path: str, voice: str) -> TTSResult:
     import edge_tts
 
     full_text = " ".join(text_lines)
-    communicate = edge_tts.Communicate(full_text, voice)
+    # edge-tts 7+ only emits sentence boundaries unless asked for words;
+    # word timings are what keep captions in sync with the voice.
+    communicate = edge_tts.Communicate(
+        full_text, voice, rate=DEFAULT_RATE, boundary="WordBoundary"
+    )
 
     word_boundaries = []
     with open(out_path, "wb") as f:
@@ -37,15 +46,35 @@ async def _synthesize(text_lines: List[str], out_path: str, voice: str) -> TTSRe
         # Fallback: estimate duration from file size is unreliable for mp3,
         # so fall back to a words-per-minute estimate for timing only.
         total_words = len(full_text.split())
-        est_duration = max(total_words / 2.5, 1.0)  # ~150 wpm
-        return TTSResult(out_path, est_duration, _even_split(text_lines, est_duration))
+        est_duration = _probe_duration(out_path) or max(total_words / 2.5, 1.0)
+        return TTSResult(out_path, est_duration, _even_split(text_lines, est_duration), [])
 
     last = word_boundaries[-1]
-    duration = (last["offset"] + last["duration"]) / 10_000_000  # 100ns units -> s
+    spoken_end = (last["offset"] + last["duration"]) / 10_000_000  # 100ns units -> s
+    # The mp3 has a little trailing silence; use its real length when available.
+    duration = max(_probe_duration(out_path), spoken_end)
 
+    words = [
+        (b["text"], b["offset"] / 10_000_000, (b["offset"] + b["duration"]) / 10_000_000)
+        for b in word_boundaries
+    ]
     # Map word boundaries back onto the original lines in order.
     timings = _map_words_to_lines(text_lines, word_boundaries)
-    return TTSResult(out_path, duration, timings)
+    return TTSResult(out_path, duration, timings, words)
+
+
+def _probe_duration(path: str) -> float:
+    import subprocess
+
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, check=True,
+        )
+        return float(probe.stdout.strip() or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _even_split(lines: List[str], total_duration: float) -> List[Tuple[str, float, float]]:
