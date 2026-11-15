@@ -1,0 +1,4 @@
+# Only needed if you run main.py with --upload (publishing to YouTube).
+# Not required to generate and save videos locally.
+google-auth-oauthlib>=1.2.0
+google-api-python-client>=2.120.0
